@@ -107,6 +107,25 @@ jobs:
           cd /d %GITHUB_WORKSPACE%
           call .\thirdparty\install.bat || exit /b 1
 
+      # ------------------------------------------------------------ Emscripten
+      # With `TARGET=c`, `generate.mk` always sets `TARGETING_EMSCRIPTEN` (unless the host is
+      # macOS), so the Emscripten SDK is required on Windows even for the native C bindings.
+      # See the "c" section of `scripts/mrbind/README-generating.md`.
+      - name: Cache Emscripten SDK
+        uses: actions/cache@v4
+        with:
+          path: C:\emsdk
+          key: emsdk-${{ runner.os }}-4.0.10
+
+      - name: Install Emscripten SDK
+        shell: cmd
+        run: |
+          if not exist C:\emsdk\emsdk.bat (
+            git clone --depth 1 https://github.com/emscripten-core/emsdk C:\emsdk || exit /b 1
+          )
+          call C:\emsdk\emsdk.bat install 4.0.10 || exit /b 1
+          call C:\emsdk\emsdk.bat activate 4.0.10 || exit /b 1
+
       # ------------------------------------------------------- MSYS2 + MRBind
       # These are the same composite actions the upstream CI uses: they install the pinned
       # Clang packages into C:\msys64 and cache the MRBind binaries.
@@ -172,16 +191,11 @@ jobs:
           Select-String -LiteralPath $path -Pattern 'ONLY_PROJECTS'
 
       # ------------------------------------------------------- generate C / C#
-      # mrbind parses with `--target=x86_64-pc-windows-msvc`, so the MSVC headers must be in
-      # INCLUDE. `VsDevCmd.bat` is set up per step (NOT job-wide): `install_mrbind_windows_msys2.bat`
-      # refuses to run when `VCToolsInstallDir` is set.
       - name: Generate C bindings
         shell: cmd
         run: |
-          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VC_PATH=%%i"
-          if not defined VC_PATH (echo Visual Studio not found & exit /b 1)
-          call "%VC_PATH%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=x86 -no_logo || exit /b 1
+          call C:\emsdk\emsdk_env.bat
+          where em++ || exit /b 1
           cd /d "%GITHUB_WORKSPACE%"
           call .\scripts\mrbind\generate_win.bat -B TARGET=c || exit /b 1
 
@@ -197,10 +211,6 @@ jobs:
       - name: Generate C# sources
         shell: cmd
         run: |
-          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VC_PATH=%%i"
-          if not defined VC_PATH (echo Visual Studio not found & exit /b 1)
-          call "%VC_PATH%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=x86 -no_logo || exit /b 1
           cd /d "%GITHUB_WORKSPACE%"
           call .\scripts\mrbind\generate_win.bat -B TARGET=csharp CSHARP_MODE=%CSHARP_MODE% || exit /b 1
 
