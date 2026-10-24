@@ -12,7 +12,11 @@ on:
       only_projects:
         description: 'Generate bindings only for these source/ projects (space separated)'
         required: false
-        default: 'MRMesh'
+        default: 'MRMesh MRIOExtras MRSymbolMesh MRVoxels'
+      extra_mrbind_flags:
+        description: 'Extra parser flags, e.g. --ignore MR::Voxels (drops whole namespaces from the bindings)'
+        required: false
+        default: '--ignore MR::Voxels --ignore MR::VoxelsLoad --ignore MR::SymbolMesh'
       assembly_name:
         description: 'Managed assembly name, without ".dll"'
         required: false
@@ -43,6 +47,7 @@ jobs:
       VCPKG_ROOT: C:\vcpkg
       VCPKG_VERSION: ${{ inputs.vcpkg_version }}
       ONLY_PROJECTS: ${{ inputs.only_projects }}
+      EXTRA_MRBIND_FLAGS: ${{ inputs.extra_mrbind_flags }}
       CSHARP_MODE: ${{ inputs.config }}
       ASSEMBLY_NAME: ${{ inputs.assembly_name }}
 
@@ -150,12 +155,12 @@ jobs:
         run: |
           $path = 'scripts/mrbind/generate.mk'
           $mk = Get-Content -Raw -LiteralPath $path
+          $nl = if ($mk.Contains("`r`n")) { "`r`n" } else { "`n" }
+          $patched = $false
 
+          # --- 1) `ONLY_PROJECTS`: narrow the input set to a subset of the `source/` projects.
           if ($mk -notmatch 'ONLY_PROJECTS') {
-            Write-Host 'Patching generate.mk...'
-
-            # Preserve the original line endings.
-            $nl = if ($mk.Contains("`r`n")) { "`r`n" } else { "`n" }
+            Write-Host 'Patching ONLY_PROJECTS...'
 
             $block = @(
               'mrcuda_PyDependsOn := $(PACKAGE_NAME).mrmeshpy',
@@ -182,13 +187,41 @@ jobs:
             # Allow overriding the file-level whitelist from the environment.
             $mk = $mk.Replace('INPUT_FILES_WHITELIST := %', 'INPUT_FILES_WHITELIST ?= %')
 
-            Set-Content -LiteralPath $path -Value $mk -NoNewline -Encoding utf8NoBOM
-          }
-          else {
-            Write-Host 'generate.mk already supports ONLY_PROJECTS, nothing to do.'
+            $patched = $true
           }
 
-          Select-String -LiteralPath $path -Pattern 'ONLY_PROJECTS'
+          # --- 2) `EXTRA_MRBIND_FLAGS`: pass extra parser flags, e.g. `--ignore MR::Voxels`.
+          if ($mk -notmatch 'EXTRA_MRBIND_FLAGS') {
+            $anchor = 'MRBIND_FLAGS := --format=$(MRBIND_PARSER_OUTPUT_FORMAT) $(call load_file,$(makefile_dir)mrbind_flags.txt)'
+            if ($mk.Contains($anchor)) {
+              Write-Host 'Patching EXTRA_MRBIND_FLAGS...'
+
+              $extra = @(
+                $anchor,
+                '',
+                '# Extra parser flags, e.g. `EXTRA_MRBIND_FLAGS=--ignore MR::Voxels`.',
+                'ifneq ($(EXTRA_MRBIND_FLAGS),)',
+                'MRBIND_FLAGS += $(EXTRA_MRBIND_FLAGS)',
+                'endif'
+              ) -join $nl
+
+              $mk = $mk.Replace($anchor, $extra)
+              $patched = $true
+            }
+            else {
+              Write-Warning 'MRBIND_FLAGS anchor not found, EXTRA_MRBIND_FLAGS was NOT added.'
+            }
+          }
+
+          if ($patched) {
+            Set-Content -LiteralPath $path -Value $mk -NoNewline -Encoding utf8NoBOM
+            Write-Host 'generate.mk patched.'
+          }
+          else {
+            Write-Host 'generate.mk already patched.'
+          }
+
+          Select-String -LiteralPath $path -Pattern 'ONLY_PROJECTS|EXTRA_MRBIND_FLAGS'
 
       # `scripts/mrbind/extra_headers/instantiate_templates.h` includes `MRVoxels/MRFloatGrid.h`
       # and forces instantiations of `MR::VoxelsLoad::DicomVolumeT`. When `MRVoxels` is not part
