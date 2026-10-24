@@ -1,11 +1,10 @@
 name: C# bindings (MRMesh only)
 
-# Generates the bindings for a subset of MeshLib (default: `source/MRMesh` only),
-# then compiles the managed C# assembly from them.
+# Generates the bindings for a subset of MeshLib (default: `source/MRMesh` only) and compiles
+# the managed C# assembly from them. Mirrors what the upstream `build-test-windows.yml` does
+# for C# bindings, but keeps everything in one job and trims the input set to MRMesh.
 #
 # Run it from the "Actions" tab -> "C# bindings (MRMesh only)" -> "Run workflow".
-# No toolchain is needed locally: MSYS2 + Clang + MRBind are installed on the runner,
-# and vcpkg dependencies are restored from the upstream binary cache.
 
 on:
   workflow_dispatch:
@@ -37,11 +36,11 @@ jobs:
     timeout-minutes: 350
 
     env:
-      # `msys2/setup-msys2` appends `\msys64` to `location`.
-      MSYS2_DIR: C:\msys64_meshlib_mrbind\msys64
-      # Make every MSYS2 shell (ours and the one started by `generate_win.bat`) keep the
-      # caller's working directory instead of jumping to `$HOME`.
-      CHERE_INVOKING: '1'
+      # Runner images ship MSYS2 at C:\msys64. `generate_win.bat` and `install_mrbind_*.bat`
+      # default to C:\msys64_meshlib_mrbind (the local-dev copy), so it must be overridden.
+      MSYS2_DIR: C:\msys64
+      MSYS2_ENV: clang64
+      VCPKG_ROOT: C:\vcpkg
       VCPKG_VERSION: ${{ inputs.vcpkg_version }}
       ONLY_PROJECTS: ${{ inputs.only_projects }}
       CSHARP_MODE: ${{ inputs.config }}
@@ -62,14 +61,9 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
+      # ---------------------------------------------------------------- vcpkg
       # `thirdparty/install.bat` picks the S3 binary-cache folder from
-      # `git describe --tags --exact-match`, so the vcpkg checkout must be exactly on a
-      # release tag, otherwise it bails out with "could not determine the vcpkg release tag".
+      # `git describe --tags --exact-match`, so the checkout must be on a release tag.
       - name: Pin vcpkg to a release tag
         shell: pwsh
         run: |
@@ -84,9 +78,8 @@ jobs:
           & C:\vcpkg\bootstrap-vcpkg.bat
           if ($LASTEXITCODE -ne 0) { throw 'bootstrap-vcpkg.bat failed.' }
 
-      # VS ships its own vcpkg in `...\VC\vcpkg` and puts it on PATH. `where vcpkg` inside
-      # `thirdparty/install.bat` keeps the *last* match, which is that one -- not a git
-      # repository at all. Drop every other vcpkg entry and keep only `C:\vcpkg`.
+      # VS ships its own vcpkg and puts it on PATH; `where vcpkg` inside
+      # `thirdparty/install.bat` keeps the *last* match, which is that one -- not a git repo.
       - name: Put the right vcpkg on PATH
         shell: pwsh
         run: |
@@ -99,8 +92,6 @@ jobs:
           Write-Host 'vcpkg matches on PATH (the last one is what install.bat uses):'
           where.exe vcpkg
 
-      # The parser needs the vcpkg headers. Restoring the binary cache is what keeps the
-      # next step at a few minutes instead of a few hours.
       - name: Restore vcpkg cache
         uses: actions/cache@v4
         with:
@@ -109,36 +100,31 @@ jobs:
             C:\vcpkg\packages
           key: vcpkg-${{ runner.os }}-${{ inputs.vcpkg_version }}-x64-windows-meshlib-${{ hashFiles('requirements/windows.txt') }}
 
+      # The parser needs the vcpkg headers (boost, eigen3, jsoncpp, ...).
       - name: Install vcpkg dependencies
         shell: cmd
         run: |
           cd /d %GITHUB_WORKSPACE%
-          call .\thirdparty\install.bat
+          call .\thirdparty\install.bat || exit /b 1
 
-      - name: Setup MSYS2
-        uses: msys2/setup-msys2@v2
+      # ------------------------------------------------------- MSYS2 + MRBind
+      # These are the same composite actions the upstream CI uses: they install the pinned
+      # Clang packages into C:\msys64 and cache the MRBind binaries.
+      - name: Install MSYS2 for MRBind
+        uses: ./.github/actions/install-msys2-mrbind
         with:
-          msystem: clang64
-          location: C:\msys64_meshlib_mrbind
-          install: make gawk procps-ng mingw-w64-clang-x86_64-cmake
-
-      - name: Install Clang in MSYS2
-        shell: msys2 {0}
-        # `msys2 {0}` doesn't always start in the workspace, so `cd` explicitly.
-        run: |
-          echo "cwd before: $(pwd)"
-          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-          cd "$(cygpath -u "$GITHUB_WORKSPACE")"
-          echo "cwd after: $(pwd)"
-          VER=$(tr -d '\r\n' < scripts/mrbind/clang_version_msys2.txt)
-          echo "Desired Clang: $VER"
-          ./scripts/mrbind/msys2_install_clang_ver.sh "$VER"
+          packages-suffix: _clang22
 
       - name: Build MRBind
-        shell: cmd
-        run: call .\scripts\mrbind\install_mrbind_windows_msys2.bat
+        uses: ./.github/actions/build-mrbind
+        with:
+          cache-key-prefix: windows-clang22
+          build-script: scripts/mrbind/install_mrbind_windows_msys2.bat
+          extra-cache-key: ${{ hashFiles('scripts/mrbind/msys2_package_hashes_clang22.txt') }}
+          msys2-env: clang64
 
-      # Adds the `ONLY_PROJECTS=...` switch to `generate.mk`, so it stays a one-file change.
+      # -------------------------------------------------------- generate.mk
+      # Adds the `ONLY_PROJECTS=...` switch, so no source file has to be committed.
       # Idempotent: skipped if `generate.mk` is already patched (e.g. committed to the repo).
       - name: Patch generate.mk (MRMesh-only switch)
         shell: pwsh
@@ -185,23 +171,50 @@ jobs:
 
           Select-String -LiteralPath $path -Pattern 'ONLY_PROJECTS'
 
-      # ---------- C: parse + generate the C bindings (also emits interop_desc.json for C#) ----------
+      # ------------------------------------------------------- generate C / C#
+      # mrbind parses with `--target=x86_64-pc-windows-msvc`, so the MSVC headers must be in
+      # INCLUDE. `VsDevCmd.bat` is set up per step (NOT job-wide): `install_mrbind_windows_msys2.bat`
+      # refuses to run when `VCToolsInstallDir` is set.
       - name: Generate C bindings
         shell: cmd
         run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VC_PATH=%%i"
+          if not defined VC_PATH (echo Visual Studio not found & exit /b 1)
+          call "%VC_PATH%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=x86 -no_logo || exit /b 1
           cd /d "%GITHUB_WORKSPACE%"
-          call .\scripts\mrbind\generate_win.bat -B TARGET=c
+          call .\scripts\mrbind\generate_win.bat -B TARGET=c || exit /b 1
 
-      # ---------- C#: consume interop_desc.json and generate the managed sources ----------
+      # The Cuda bindings are no longer generated (the `mrcuda` module is filtered out), but
+      # CMakeLists.txt unconditionally adds this project. Use the upstream placeholder so the
+      # native build still configures.
+      - name: Stub out the Cuda bindings project
+        shell: pwsh
+        run: |
+          Copy-Item scripts/mrbind/cuda_placeholder_generated_c/include source/MeshLibC2Cuda -Recurse -Force
+          Copy-Item scripts/mrbind/cuda_placeholder_generated_c/src source/MeshLibC2Cuda -Recurse -Force
+
       - name: Generate C# sources
         shell: cmd
         run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VC_PATH=%%i"
+          if not defined VC_PATH (echo Visual Studio not found & exit /b 1)
+          call "%VC_PATH%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=x86 -no_logo || exit /b 1
           cd /d "%GITHUB_WORKSPACE%"
-          call .\scripts\mrbind\generate_win.bat -B TARGET=csharp CSHARP_MODE=%CSHARP_MODE% generate
+          call .\scripts\mrbind\generate_win.bat -B TARGET=csharp CSHARP_MODE=%CSHARP_MODE% || exit /b 1
 
       - name: Build managed assembly
-        shell: cmd
-        run: dotnet build source\MRDotNet2 -c %CSHARP_MODE% -p:AssemblyName=%ASSEMBLY_NAME%
+        shell: pwsh
+        run: |
+          dotnet build source/MRDotNet2 -c $env:CSHARP_MODE -p:AssemblyName=$env:ASSEMBLY_NAME
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # `generate.mk` already built the default-named assembly; drop it so the artifact
+          # only carries the renamed one.
+          if ($env:ASSEMBLY_NAME -ne 'MRDotNet2') {
+            Remove-Item "source/x64/$env:CSHARP_MODE/MRDotNet2.*" -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -212,6 +225,8 @@ jobs:
             source/MeshLibC2/include/**
             source/MeshLibC2/src/**
             source/MeshLibC2/temp/interop_desc.json
+            source/MeshLibC2Cuda/include/**
+            source/MeshLibC2Cuda/src/**
             source/MRDotNet2/MRDotNet2.csproj
             source/MRDotNet2/src/**
             source/x64/${{ inputs.config }}/*.dll
