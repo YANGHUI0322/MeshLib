@@ -26,15 +26,20 @@ on:
         options:
           - Release
           - Debug
+      vcpkg_version:
+        description: 'vcpkg release tag (see .github/workflows/config.yml)'
+        required: false
+        default: '2026.07.29'
 
 jobs:
   bindings:
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 350
 
     env:
       # `msys2/setup-msys2` appends `\msys64` to `location`.
       MSYS2_DIR: C:\msys64_meshlib_mrbind\msys64
+      VCPKG_VERSION: ${{ inputs.vcpkg_version }}
       ONLY_PROJECTS: ${{ inputs.only_projects }}
       CSHARP_MODE: ${{ inputs.config }}
       ASSEMBLY_NAME: ${{ inputs.assembly_name }}
@@ -59,23 +64,51 @@ jobs:
         with:
           arch: x64
 
-      # The parser needs the vcpkg headers. Restoring the binary cache is what keeps this
-      # step at a few minutes instead of a few hours.
+      # `thirdparty/install.bat` picks the S3 binary-cache folder from
+      # `git describe --tags --exact-match`, so the vcpkg checkout must be exactly on a
+      # release tag, otherwise it bails out with "could not determine the vcpkg release tag".
+      - name: Pin vcpkg to a release tag
+        shell: pwsh
+        run: |
+          $ver = $env:VCPKG_VERSION
+          Write-Host "Using vcpkg $ver"
+          git -C C:\vcpkg fetch --tags --force origin
+          git -C C:\vcpkg fetch --unshallow 2>&1 | Out-Null
+          git -C C:\vcpkg reset --hard
+          git -C C:\vcpkg clean -ffdx
+          git -C C:\vcpkg checkout --force $ver
+          if ($LASTEXITCODE -ne 0) { throw "Can't check out vcpkg tag '$ver'." }
+          & C:\vcpkg\bootstrap-vcpkg.bat
+          if ($LASTEXITCODE -ne 0) { throw 'bootstrap-vcpkg.bat failed.' }
+
+      # VS ships its own vcpkg in `...\VC\vcpkg` and puts it on PATH. `where vcpkg` inside
+      # `thirdparty/install.bat` keeps the *last* match, which is that one -- not a git
+      # repository at all. Drop every other vcpkg entry and keep only `C:\vcpkg`.
+      - name: Put the right vcpkg on PATH
+        shell: pwsh
+        run: |
+          $items = ($env:PATH -split ';') | Where-Object { $_ -and ($_ -notmatch '(?i)[\\/]vcpkg[\\/]?$') }
+          $newPath = 'C:\vcpkg;' + ($items -join ';')
+          "PATH=$newPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKG_ROOT=C:\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $env:PATH = $newPath
+          & C:\vcpkg\vcpkg.exe integrate install
+          Write-Host 'vcpkg matches on PATH (the last one is what install.bat uses):'
+          where.exe vcpkg
+
+      # The parser needs the vcpkg headers. Restoring the binary cache is what keeps the
+      # next step at a few minutes instead of a few hours.
       - name: Restore vcpkg cache
         uses: actions/cache@v4
         with:
           path: |
             C:\vcpkg\installed
             C:\vcpkg\packages
-          key: vcpkg-${{ runner.os }}-x64-windows-meshlib-${{ hashFiles('requirements/windows.txt') }}
+          key: vcpkg-${{ runner.os }}-${{ inputs.vcpkg_version }}-x64-windows-meshlib-${{ hashFiles('requirements/windows.txt') }}
 
       - name: Install vcpkg dependencies
         shell: cmd
         run: |
-          cd /d C:\vcpkg
-          if not exist vcpkg.exe call bootstrap-vcpkg.bat
-          .\vcpkg.exe integrate install
-          set "PATH=C:\vcpkg;%PATH%"
           cd /d %GITHUB_WORKSPACE%
           call .\thirdparty\install.bat
 
