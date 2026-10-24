@@ -39,6 +39,9 @@ jobs:
     env:
       # `msys2/setup-msys2` appends `\msys64` to `location`.
       MSYS2_DIR: C:\msys64_meshlib_mrbind\msys64
+      # Make every MSYS2 shell (ours and the one started by `generate_win.bat`) keep the
+      # caller's working directory instead of jumping to `$HOME`.
+      CHERE_INVOKING: '1'
       VCPKG_VERSION: ${{ inputs.vcpkg_version }}
       ONLY_PROJECTS: ${{ inputs.only_projects }}
       CSHARP_MODE: ${{ inputs.config }}
@@ -121,7 +124,15 @@ jobs:
 
       - name: Install Clang in MSYS2
         shell: msys2 {0}
-        run: ./scripts/mrbind/msys2_install_clang_ver.sh $(cat scripts/mrbind/clang_version_msys2.txt)
+        # `msys2 {0}` doesn't always start in the workspace, so `cd` explicitly.
+        run: |
+          echo "cwd before: $(pwd)"
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          cd "$(cygpath -u "$GITHUB_WORKSPACE")"
+          echo "cwd after: $(pwd)"
+          VER=$(tr -d '\r\n' < scripts/mrbind/clang_version_msys2.txt)
+          echo "Desired Clang: $VER"
+          ./scripts/mrbind/msys2_install_clang_ver.sh "$VER"
 
       - name: Build MRBind
         shell: cmd
@@ -177,12 +188,16 @@ jobs:
       # ---------- C: parse + generate the C bindings (also emits interop_desc.json for C#) ----------
       - name: Generate C bindings
         shell: cmd
-        run: call .\scripts\mrbind\generate_win.bat -B TARGET=c
+        run: |
+          cd /d "%GITHUB_WORKSPACE%"
+          call .\scripts\mrbind\generate_win.bat -B TARGET=c
 
       # ---------- C#: consume interop_desc.json and generate the managed sources ----------
       - name: Generate C# sources
         shell: cmd
-        run: call .\scripts\mrbind\generate_win.bat -B TARGET=csharp CSHARP_MODE=%CSHARP_MODE% generate
+        run: |
+          cd /d "%GITHUB_WORKSPACE%"
+          call .\scripts\mrbind\generate_win.bat -B TARGET=csharp CSHARP_MODE=%CSHARP_MODE% generate
 
       - name: Build managed assembly
         shell: cmd
