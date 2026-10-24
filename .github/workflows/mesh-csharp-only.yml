@@ -190,6 +190,32 @@ jobs:
 
           Select-String -LiteralPath $path -Pattern 'ONLY_PROJECTS'
 
+      # `scripts/mrbind/extra_headers/instantiate_templates.h` includes `MRVoxels/MRFloatGrid.h`
+      # and forces instantiations of `MR::VoxelsLoad::DicomVolumeT`. When `MRVoxels` is not part
+      # of the input set, `MRVoxelsLoad.h` is never parsed, and `MRVoxelsFwd.h` then fails with
+      # "implicit instantiation of undefined template DicomVolume".
+      # Dropping the Voxels lines keeps the template instantiations we do need (Vector2/3, the
+      # Object* tree helpers) without pulling the whole voxels module in.
+      - name: Trim the extra headers to the selected projects
+        shell: pwsh
+        run: |
+          if ($env:ONLY_PROJECTS -and $env:ONLY_PROJECTS -notmatch 'MRVoxels') {
+            $path = 'scripts/mrbind/extra_headers/instantiate_templates.h'
+            $text = Get-Content -Raw -LiteralPath $path
+            # `SimpleVolumeMinMax` lives in MRVoxels as well, but the identifier does not
+            # contain "Voxel", so match it explicitly.
+            $voxels = 'Voxel|SimpleVolumeMinMax'
+            if ($text -match $voxels) {
+              Write-Host 'Removing these MRVoxels references from instantiate_templates.h:'
+              Select-String -LiteralPath $path -Pattern $voxels
+              $kept = ($text -split "`r?`n") | Where-Object { $_ -notmatch $voxels }
+              Set-Content -LiteralPath $path -Value ($kept -join "`n") -NoNewline -Encoding utf8NoBOM
+            }
+          }
+          else {
+            Write-Host 'MRVoxels is part of ONLY_PROJECTS, leaving instantiate_templates.h alone.'
+          }
+
       # ------------------------------------------------------- generate C / C#
       - name: Generate C bindings
         shell: cmd
