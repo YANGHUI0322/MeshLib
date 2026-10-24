@@ -30,7 +30,7 @@ if errorlevel 1 (
 )
 
 REM Detect vcpkg path
-for /f "delims=" %%i in ('where vcpkg 2^>nul') do set vcpkg_path=%%~dpi
+for /f "delims=" %%i in ('where vcpkg 2^>nul') do if not defined vcpkg_path set vcpkg_path=%%~dpi
 if not defined vcpkg_path (
     echo vcpkg not found. Setting VCPKG_TAG to "no-tag".
     set VCPKG_TAG=no-tag
