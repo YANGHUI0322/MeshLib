@@ -12,11 +12,11 @@ on:
       only_projects:
         description: 'Generate bindings only for these source/ projects (space separated)'
         required: false
-        default: 'MRMesh MRIOExtras MRSymbolMesh MRVoxels'
+        default: 'MRMesh'
       extra_mrbind_flags:
-        description: 'Extra parser flags, e.g. --ignore MR::Voxels (drops whole namespaces from the bindings)'
+        description: 'Extra parser flags; regex ignores work, e.g. "/MR::LoadedObjectT<MR::ObjectVoxels.*>/"'
         required: false
-        default: '--ignore MR::Voxels --ignore MR::VoxelsLoad --ignore MR::SymbolMesh'
+        default: --ignore '/MR::LoadedObjectT<MR::ObjectVoxels.*>/'
       assembly_name:
         description: 'Managed assembly name, without ".dll"'
         required: false
