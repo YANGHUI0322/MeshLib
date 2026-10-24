@@ -1,0 +1,183 @@
+name: C# bindings (MRMesh only)
+
+# Generates the bindings for a subset of MeshLib (default: `source/MRMesh` only),
+# then compiles the managed C# assembly from them.
+#
+# Run it from the "Actions" tab -> "C# bindings (MRMesh only)" -> "Run workflow".
+# No toolchain is needed locally: MSYS2 + Clang + MRBind are installed on the runner,
+# and vcpkg dependencies are restored from the upstream binary cache.
+
+on:
+  workflow_dispatch:
+    inputs:
+      only_projects:
+        description: 'Generate bindings only for these source/ projects (space separated)'
+        required: false
+        default: 'MRMesh'
+      assembly_name:
+        description: 'Managed assembly name, without ".dll"'
+        required: false
+        default: 'MRDotNetMeshOnly'
+      config:
+        description: 'Build configuration'
+        required: false
+        type: choice
+        default: 'Release'
+        options:
+          - Release
+          - Debug
+
+jobs:
+  bindings:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    env:
+      # `msys2/setup-msys2` appends `\msys64` to `location`.
+      MSYS2_DIR: C:\msys64_meshlib_mrbind\msys64
+      ONLY_PROJECTS: ${{ inputs.only_projects }}
+      CSHARP_MODE: ${{ inputs.config }}
+      ASSEMBLY_NAME: ${{ inputs.assembly_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Checkout mrbind submodule
+        run: git submodule update --init --recursive --depth 1 thirdparty/mrbind
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # The parser needs the vcpkg headers. Restoring the binary cache is what keeps this
+      # step at a few minutes instead of a few hours.
+      - name: Restore vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\packages
+          key: vcpkg-${{ runner.os }}-x64-windows-meshlib-${{ hashFiles('requirements/windows.txt') }}
+
+      - name: Install vcpkg dependencies
+        shell: cmd
+        run: |
+          cd /d C:\vcpkg
+          if not exist vcpkg.exe call bootstrap-vcpkg.bat
+          .\vcpkg.exe integrate install
+          set "PATH=C:\vcpkg;%PATH%"
+          cd /d %GITHUB_WORKSPACE%
+          call .\thirdparty\install.bat
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: clang64
+          location: C:\msys64_meshlib_mrbind
+          install: make gawk procps-ng mingw-w64-clang-x86_64-cmake
+
+      - name: Install Clang in MSYS2
+        shell: msys2 {0}
+        run: ./scripts/mrbind/msys2_install_clang_ver.sh $(cat scripts/mrbind/clang_version_msys2.txt)
+
+      - name: Build MRBind
+        shell: cmd
+        run: call .\scripts\mrbind\install_mrbind_windows_msys2.bat
+
+      # Adds the `ONLY_PROJECTS=...` switch to `generate.mk`, so it stays a one-file change.
+      # Idempotent: skipped if `generate.mk` is already patched (e.g. committed to the repo).
+      - name: Patch generate.mk (MRMesh-only switch)
+        shell: pwsh
+        run: |
+          $path = 'scripts/mrbind/generate.mk'
+          $mk = Get-Content -Raw -LiteralPath $path
+
+          if ($mk -notmatch 'ONLY_PROJECTS') {
+            Write-Host 'Patching generate.mk...'
+
+            # Preserve the original line endings.
+            $nl = if ($mk.Contains("`r`n")) { "`r`n" } else { "`n" }
+
+            $block = @(
+              'mrcuda_PyDependsOn := $(PACKAGE_NAME).mrmeshpy',
+              '',
+              '',
+              '# Optional: restrict the bindings to a subset of the `source/` projects listed above.',
+              '# Example: `ONLY_PROJECTS=MRMesh` generates the bindings from `source/MRMesh/` only,',
+              '#   dropping `MRIOExtras`, `MRSymbolMesh`, `MRVoxels`, `MRCuda` (and the `mrcuda` module).',
+              '# The `*_ExtraInputDirs` are always kept. Empty by default, meaning "everything".',
+              'ifneq ($(ONLY_PROJECTS),)',
+              '# Drop the modules that have no projects left after the filtering.',
+              'override MODULES := $(foreach m,$(MODULES),$(if $(filter $(ONLY_PROJECTS),$($m_InputProjects)),$m))',
+              '$(info Only these projects: $(ONLY_PROJECTS); only these modules: $(MODULES))',
+              'endif'
+            ) -join $nl
+
+            $mk = $mk.Replace('mrcuda_PyDependsOn := $(PACKAGE_NAME).mrmeshpy', $block)
+
+            $mk = $mk.Replace(
+              '$(call var,$1__InputDirs := $(addprefix $(makefile_dir)../../source/,$($1_InputProjects)) $($1_ExtraInputDirs))',
+              '$(call var,$1__InputDirs := $(addprefix $(makefile_dir)../../source/,$(if $(ONLY_PROJECTS),$(filter $(ONLY_PROJECTS),$($1_InputProjects)),$($1_InputProjects))) $($1_ExtraInputDirs))'
+            )
+
+            # Allow overriding the file-level whitelist from the environment.
+            $mk = $mk.Replace('INPUT_FILES_WHITELIST := %', 'INPUT_FILES_WHITELIST ?= %')
+
+            Set-Content -LiteralPath $path -Value $mk -NoNewline -Encoding utf8NoBOM
+          }
+          else {
+            Write-Host 'generate.mk already supports ONLY_PROJECTS, nothing to do.'
+          }
+
+          Select-String -LiteralPath $path -Pattern 'ONLY_PROJECTS'
+
+      # ---------- C: parse + generate the C bindings (also emits interop_desc.json for C#) ----------
+      - name: Generate C bindings
+        shell: cmd
+        run: call .\scripts\mrbind\generate_win.bat -B TARGET=c
+
+      # ---------- C#: consume interop_desc.json and generate the managed sources ----------
+      - name: Generate C# sources
+        shell: cmd
+        run: call .\scripts\mrbind\generate_win.bat -B TARGET=csharp CSHARP_MODE=%CSHARP_MODE% generate
+
+      - name: Build managed assembly
+        shell: cmd
+        run: dotnet build source\MRDotNet2 -c %CSHARP_MODE% -p:AssemblyName=%ASSEMBLY_NAME%
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: meshlib-mrmesh-csharp
+          if-no-files-found: error
+          path: |
+            source/MeshLibC2/include/**
+            source/MeshLibC2/src/**
+            source/MeshLibC2/temp/interop_desc.json
+            source/MRDotNet2/MRDotNet2.csproj
+            source/MRDotNet2/src/**
+            source/x64/${{ inputs.config }}/*.dll
+            source/x64/${{ inputs.config }}/*.xml
+
+      - name: Report
+        shell: pwsh
+        run: |
+          Write-Host 'Generated C binding projects:'
+          Get-ChildItem source/MeshLibC2/src -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  - $($_.Name)" }
+
+          Write-Host ''
+          Write-Host 'Managed assemblies:'
+          Get-ChildItem "source/x64/$env:CSHARP_MODE" -Filter *.dll -ErrorAction SilentlyContinue |
+            Select-Object Name, @{n='MB';e={[math]::Round($_.Length / 1MB, 2)}} |
+            Format-Table | Out-String | Write-Host
